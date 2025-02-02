@@ -22,11 +22,7 @@ class Gateway extends SubscriptionGateway
     /**
      * The currencies supported by the gateway.
      */
-    protected array $currencies = [
-        'USD',
-        'EUR',
-        // etc...
-    ];
+    protected array $currencies = [];
 
     /**
      * Define the config fields required for the gateway.
