@@ -1,6 +1,6 @@
 <?php
 
-namespace App\Gateways\StripeSubscriptionGateway;
+namespace App\Gateways\StripeSubscriptions;
 
 use LaraPay\Framework\Interfaces\SubscriptionGateway;
 use Illuminate\Support\Facades\Http;
@@ -12,7 +12,7 @@ class Gateway extends SubscriptionGateway
     /**
      * Unique identifier for the gateway.
      */
-    protected string $identifier = 'stripe-subscription-gateway';
+    protected string $identifier = 'stripe-subscriptions';
 
     /**
      * Version of the gateway.
@@ -36,18 +36,17 @@ class Gateway extends SubscriptionGateway
     public function config(): array
     {
         return [
-            'mode' => [
-                'label'       => 'Mode (Test/Live)',
-                'description' => 'Use test mode for testing or live for production',
-                'type'        => 'select',
-                'options'     => ['test' => 'Test', 'live' => 'Live'],
-                'rules'       => ['required'],
-            ],
             'secret_key' => [
                 'label'       => 'Stripe Secret Key',
                 'description' => 'Your Stripe Secret API Key',
                 'type'        => 'text',
-                'rules'       => ['required', 'string'],
+                'rules'       => ['required', 'string', 'starts_with:sk_'],
+            ],
+            'webhook_secret' => [
+                'label'       => 'Stripe Webhook Secret',
+                'description' => 'Your Stripe Webhook Secret',
+                'type'        => 'text',
+                'rules'       => ['required', 'string', 'starts_with:whsec_'],
             ],
             // Add other fields as needed (e.g., publishable key, webhook secret, etc.)
         ];
@@ -64,13 +63,17 @@ class Gateway extends SubscriptionGateway
         // Retrieve config
         $secretKey = $subscription->gateway->config('secret_key');
         $amountInCents = (int) ($subscription->amount * 100);
+        $period = $this->getOptimalInterval($subscription->frequency);
 
         // Prepare the request data for creating a Stripe Checkout Session
         // More docs: https://stripe.com/docs/api/checkout/sessions/create
         $data = [
-            'success_url' => $subscription->callbackUrl(['session_id' => '{CHECKOUT_SESSION_ID}']),
+            'success_url' => $subscription->callbackUrl(),
             'cancel_url'  => $subscription->cancelUrl(),
             'mode'        => 'subscription',
+            'metadata'    => [
+                'subscription_token' => $subscription->token,
+            ],
             'line_items'  => [
                 [
                     'price_data' => [
@@ -83,11 +86,16 @@ class Gateway extends SubscriptionGateway
                         'recurring' => [
                             // You can map $subscription->frequency (days) to an interval here.
                             // For simplicity, let's assume a daily frequency if $subscription->frequency = 1 day
-                            'interval'      => 'day',
-                            'interval_count' => $subscription->frequency,
+                            'interval'      => $period['interval'],
+                            'interval_count' => $period['frequency'],
                         ],
                     ],
                     'quantity' => 1,
+                ],
+            ],
+            'subscription_data' => [
+                'metadata' => [
+                    'subscription_token' => $subscription->token,
                 ],
             ],
         ];
@@ -113,12 +121,36 @@ class Gateway extends SubscriptionGateway
     }
 
     /**
+     * Helps find an interval (DAY, WEEK, MONTH, YEAR) that evenly divides $days.
+     */
+    private function getOptimalInterval(int $days): array
+    {
+        $intervals = [
+            365 => 'year',
+            30 => 'month',
+            7 => 'week',
+            1 => 'day',
+        ];
+
+        // Pick the largest interval that cleanly divides $days
+        foreach ($intervals as $dayEquivalent => $label) {
+            if ($days % $dayEquivalent === 0) {
+                return [
+                    'frequency' => $days / $dayEquivalent,
+                    'interval'  => $label
+                ];
+            }
+        }
+
+        // Fallback (shouldn't usually happen unless you have weird intervals)
+        return ['frequency' => 1, 'interval' => 'day'];
+    }
+
+    /**
      * Handle the callback/return URL from Stripe after a successful checkout.
      */
     public function callback(Request $request)
     {
-        // We expect Stripe to redirect back with ?session_id={CHECKOUT_SESSION_ID} on success
-        $sessionId = $request->query('session_id');
         $token     = $request->query('subscription_token'); // or however your system tracks subscription tokens
 
         // Retrieve local subscription by token
@@ -127,10 +159,24 @@ class Gateway extends SubscriptionGateway
             throw new \Exception('Subscription not found');
         }
 
+        $sessionId = $subscription->subscription_id;
+
+        // check if the session id starts with cs_ to know if it is a checkout session
+        if (strpos($sessionId, 'cs_') !== 0) {
+
+            // if starts with sub_ and assume the webhook has already taken care of the subscription
+            if(strpos($sessionId, 'sub_') === 0) {
+                return redirect($subscription->successUrl());
+            }
+
+            throw new \Exception('Invalid Stripe Checkout Session ID');
+        }
+
         // Retrieve the Checkout Session from Stripe to verify subscription status
         $secretKey = $subscription->gateway->config('secret_key');
         $checkoutSessionResponse = Http::withBasicAuth($secretKey, '')
             ->get("https://api.stripe.com/v1/checkout/sessions/{$sessionId}");
+
 
         if ($checkoutSessionResponse->failed()) {
             throw new \Exception('Failed to retrieve Stripe Checkout Session: ' . $checkoutSessionResponse->body());
@@ -152,9 +198,15 @@ class Gateway extends SubscriptionGateway
                 ->get("https://api.stripe.com/v1/subscriptions/{$stripeSubscriptionId}")
                 ->json();
 
+
             // If the subscription is "active" or "trialing", mark it active in your system
             if (in_array($stripeSubscriptionResponse['status'], ['active','trialing'])) {
                 $subscription->activate($stripeSubscriptionId, $stripeSubscriptionResponse);
+
+                // set the due date for the subscription
+                $subscription->update([
+                    'expires_at' => $stripeSubscriptionResponse['current_period_end'],
+                ]);
             }
         }
 
@@ -173,34 +225,41 @@ class Gateway extends SubscriptionGateway
         // Stripe sends JSON in the request body
         $eventData = $request->json()->all();
 
-        // For real production usage, verify the signature:
-        // $signature = $request->header('Stripe-Signature');
-        // ... then use that to check with your webhook secret.
-
         $eventType = $eventData['type'] ?? null;
-        $object    = $eventData['data']['object'] ?? [];
+
+        // get the subscription token from the metadata
+        $subscriptionToken = $eventData['data']['object']['metadata']['subscription_token'];
+        $subscription = Subscription::where('token', $subscriptionToken)->first();
+
+        if (! $subscription) {
+            throw new \Exception('Subscription not found');
+        }
+
+        // Verify the webhook signature
+        $this->verifyStripeWebhook($subscription->gateway->config('webhook_secret'));
 
         switch ($eventType) {
             case 'customer.subscription.created':
             case 'customer.subscription.updated':
-            case 'customer.subscription.deleted':
-                $stripeSubscriptionId = $object['id'];
-                $status = $object['status'];
+                $subscriptionObject = $eventData['data']['object'];
 
-                // Find your local subscription record by the Stripe subscription ID
-                $subscription = Subscription::where('subscription_id', $stripeSubscriptionId)->first();
-
-                if ($subscription) {
-                    if (in_array($status, ['active', 'trialing'])) {
-                        $subscription->activate($stripeSubscriptionId, $object);
-                    } elseif ($status === 'canceled') {
-                        $subscription->cancel();
-                        // or $subscription->deactivate() depending on how your system handles it
+                // If the subscription is active or trialing, mark it as active in your system
+                if (in_array($subscriptionObject['status'], ['active', 'trialing'])) {
+                    // ensure subscription is not already active
+                    if ($subscription->isActive()) {
+                        return response()->json(['status' => 'ok'], 200);
                     }
-                    // handle other statuses if needed (e.g. 'past_due', 'incomplete', etc.)
-                }
-                break;
 
+                    $subscription->activate($subscriptionObject['id'], $subscriptionObject);
+
+                    // set the due date for the subscription
+                    $subscription->update([
+                        'expires_at' => $subscriptionObject['current_period_end'],
+                    ]);
+                }
+
+                break;
+            case 'customer.subscription.deleted':
             // You can handle more Stripe events if desired
             default:
                 // Ignore other events
@@ -208,6 +267,46 @@ class Gateway extends SubscriptionGateway
         }
 
         return response()->json(['status' => 'ok'], 200);
+    }
+
+    private function verifyStripeWebhook($webhookSecret)
+    {
+        // Get the raw request body
+        $payload = file_get_contents('php://input');
+
+        // Retrieve the Stripe signature header
+        $sigHeader = $_SERVER['HTTP_STRIPE_SIGNATURE'] ?? null;
+
+        if (!$sigHeader) {
+            throw new \Exception("Stripe signature header is missing.");
+        }
+
+        // Parse the Stripe signature header
+        $timestamp = null;
+        $signature = null;
+        foreach (explode(',', $sigHeader) as $part) {
+            list($key, $value) = explode('=', trim($part), 2);
+            if ($key === 't') {
+                $timestamp = $value;
+            } elseif ($key === 'v1') {
+                $signature = $value;
+            }
+        }
+
+        if (!$timestamp || !$signature) {
+            throw new \Exception("Invalid Stripe signature header format.");
+        }
+
+        // Compute the expected signature
+        $signedPayload = $timestamp . '.' . $payload;
+        $expectedSignature = hash_hmac('sha256', $signedPayload, $webhookSecret);
+
+        // Compare the computed signature with the Stripe-provided signature
+        if (!hash_equals($expectedSignature, $signature)) {
+            throw new \Exception("Invalid Stripe webhook signature.");
+        }
+
+        return json_decode($payload, true); // Return the webhook event as an array
     }
 
     /**
